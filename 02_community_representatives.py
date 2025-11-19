@@ -10,16 +10,52 @@ import plotly.graph_objects as go
 import build_networks as bn
 
 # 尝试导入 Louvain 社区检测库
+_louvain_partition_fn = None
 try:
     import community as community_louvain  # python-louvain 典型用法
+
+    def _louvain_partition_fn(G, resolution, random_state):
+        return community_louvain.best_partition(
+            G,
+            weight="weight",
+            resolution=resolution,
+            random_state=random_state,
+        )
+
 except ImportError:
     try:
         from community import community_louvain  # 有些版本在子模块
-    except ImportError as e:
-        raise ImportError(
-            "需要安装 python-louvain 库才能运行本脚本：\n"
-            "    pip install python-louvain\n"
-        ) from e
+
+        def _louvain_partition_fn(G, resolution, random_state):
+            return community_louvain.best_partition(
+                G,
+                weight="weight",
+                resolution=resolution,
+                random_state=random_state,
+            )
+
+    except ImportError:
+        # NetworkX 从 2.8 起内置了 louvain_communities，可作为后备方案
+        try:
+            from networkx.algorithms.community import louvain_communities
+
+            def _louvain_partition_fn(G, resolution, random_state):
+                comms = louvain_communities(
+                    G,
+                    weight="weight",
+                    resolution=resolution,
+                    seed=random_state,
+                )
+                partition = {}
+                for cid, nodes in enumerate(comms):
+                    for n in nodes:
+                        partition[n] = cid
+                return partition
+
+        except Exception as e:  # pragma: no cover - 极端环境
+            raise ImportError(
+                "需要安装 python-louvain 或使用 NetworkX>=2.8 才能运行本脚本。"
+            ) from e
 
 # =========================
 # 配置区：方案 2 - 社区代表网络
@@ -57,13 +93,7 @@ def detect_louvain_communities(G: nx.Graph,
     """
     if G.number_of_nodes() == 0:
         return {}
-    partition = community_louvain.best_partition(
-        G,
-        weight="weight",
-        resolution=resolution,
-        random_state=random_state
-    )
-    return partition
+    return _louvain_partition_fn(G, resolution, random_state)
 
 
 def build_community_representative_graph(
