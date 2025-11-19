@@ -1,203 +1,223 @@
-# 04_matrices_and_timeseries.py
-"""
-方案 5：矩阵 / 热力图 / 中心性时间序列
+"""方案 5：以热力图 / 矩阵与中心性时间序列替代大型网络图。
 
-功能：
-- 从 network_macro_merged.xlsx 的 "nodes_with_stress" 读取节点指标
-- 从 edges/{dataset}_{year}_edges.csv 读取边表
-- 对每个 dataset-year 生成加权邻接矩阵热力图：
-    outputs/matrices/adjacency_{dataset}_{year}.png
-- 对每个 dataset 生成 Top N 公司 eigenvector_adj 随时间变化折线图：
-    outputs/timeseries/centrality_timeseries_{dataset}.png
+该脚本复用 build_networks.py 的数据读入逻辑：
+- 从 GLOBAL / RISK / RETURN 三个 Excel 中读取每个 sheet（年份）。
+- 针对每个网络生成一个邻接矩阵热力图（按 eigenvector centrality 排序）。
+- 针对每个数据集，汇总所有年份的 eigenvector centrality，绘制 Top-N 公司的
+  时间序列图，展示结构性变化。
+
+输出目录保持独立，避免覆盖原有 output：
+- output_matrix_ts/matrices/*.png  （邻接矩阵热力图）
+- output_matrix_ts/timeseries/*.png（中心性时间序列）
 """
 
+from __future__ import annotations
+
+import os
 from pathlib import Path
-from typing import List
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 import networkx as nx
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+import build_networks as bn
 
 # =====================
 # 配置
 # =====================
 
-BASE_DIR = Path(__file__).resolve().parent
+DATASETS: List[Tuple[str, str]] = [
+    ("GLOBAL", bn.FULL_EXCEL),
+    ("RISK", bn.RISK_EXCEL),
+    ("RETURN", bn.RETURN_EXCEL),
+]
 
-NODES_FILE = BASE_DIR / "network_macro_merged.xlsx"
-EDGES_DIR = BASE_DIR / "edges"
-OUTPUT_DIR = BASE_DIR / "outputs"
+OUTPUT_DIR = "output_matrix_ts"
+HEATMAP_DIR = os.path.join(OUTPUT_DIR, "matrices")
+TIMESERIES_DIR = os.path.join(OUTPUT_DIR, "timeseries")
 
-DATASETS = ["GLOBAL", "RISK", "RETURN"]
-YEARS = list(range(2006, 2025))
-
-TOP_N_CENTRAL = 10   # 时间序列图中展示的公司数量
+TOP_N_CENTRAL = 10  # 时间序列图中展示的公司数量
 
 
 # =====================
 # 公共工具
 # =====================
 
-def ensure_output_dir(subdir: str) -> Path:
-    out = OUTPUT_DIR / subdir
-    out.mkdir(parents=True, exist_ok=True)
-    return out
+def ensure_dirs() -> None:
+    os.makedirs(HEATMAP_DIR, exist_ok=True)
+    os.makedirs(TIMESERIES_DIR, exist_ok=True)
 
 
-def load_nodes_all() -> pd.DataFrame:
-    """载入全部 nodes_with_stress，用于时间序列。"""
-    return pd.read_excel(NODES_FILE, sheet_name="nodes_with_stress")
-
-
-def load_nodes(dataset: str, year: int) -> pd.DataFrame:
-    df = pd.read_excel(NODES_FILE, sheet_name="nodes_with_stress")
-    sub = df[(df["dataset"] == dataset) & (df["year"] == year)].copy()
-    if sub.empty:
-        raise ValueError(f"nodes_with_stress 中找不到 dataset={dataset}, year={year} 的记录")
-    return sub
-
-
-def load_edges(dataset: str, year: int) -> pd.DataFrame:
-    edges_file = EDGES_DIR / f"{dataset}_{year}_edges.csv"
-    if not edges_file.exists():
-        raise FileNotFoundError(f"未找到边表文件: {edges_file}")
-    edges = pd.read_csv(edges_file)
-    required = {"source", "target", "weight"}
-    if not required.issubset(edges.columns):
-        raise ValueError(f"{edges_file} 缺少必要列: {required}")
-    return edges
-
-
-def build_graph(nodes_df: pd.DataFrame, edges_df: pd.DataFrame) -> nx.Graph:
-    G = nx.Graph()
-
-    for _, r in nodes_df.iterrows():
-        code = r["Code"]
-        G.add_node(
-            code,
-            empresa=r.get("empresa", code),
-            eigenvector=r.get("eigenvector", np.nan),
-            eigenvector_adj=r.get("eigenvector_adj", r.get("eigenvector", np.nan)),
-            degree=r.get("degree", np.nan),
-            strength=r.get("strength", np.nan),
-            dataset=r.get("dataset"),
-            year=int(r.get("year")),
-        )
-
-    for _, r in edges_df.iterrows():
-        u, v = r["source"], r["target"]
-        if u in G.nodes and v in G.nodes:
-            G.add_edge(u, v, weight=float(r.get("weight", 1.0)))
-
-    return G
+def compute_eigenvector(G: nx.Graph) -> Dict[str, float]:
+    if G.number_of_nodes() == 0:
+        return {}
+    try:
+        return nx.eigenvector_centrality(G, max_iter=1000, weight="weight")
+    except nx.PowerIterationFailedConvergence:
+        # 若不收敛，退化为度中心性
+        deg = dict(G.degree(weight="weight"))
+        max_deg = max(deg.values()) if deg else 1.0
+        return {n: (deg.get(n, 0.0) / max_deg if max_deg > 0 else 0.0) for n in G.nodes()}
 
 
 # =====================
 # 邻接矩阵热力图
 # =====================
 
-def generate_adjacency_heatmap(dataset: str, year: int) -> Path:
-    nodes_df = load_nodes(dataset, year)
-    edges_df = load_edges(dataset, year)
-    G = build_graph(nodes_df, edges_df)
+def generate_adjacency_heatmap(
+    G: nx.Graph,
+    meta: dict,
+    eigenvector: Dict[str, float],
+    out_path: str,
+) -> None:
+    if G.number_of_nodes() == 0:
+        return
 
-    # 节点排序：按 eigenvector_adj 由高到低
+    # 节点排序：按 eigenvector 由高到低
     node_order = sorted(
         G.nodes(),
-        key=lambda n: G.nodes[n].get("eigenvector_adj", G.nodes[n].get("eigenvector", 0.0)),
+        key=lambda n: eigenvector.get(n, 0.0),
         reverse=True,
     )
-
     A = nx.to_numpy_array(G, nodelist=node_order, weight="weight")
-
-    out_dir = ensure_output_dir("matrices")
-    png_path = out_dir / f"adjacency_{dataset}_{year}.png"
 
     plt.figure(figsize=(6, 6))
     plt.imshow(A, aspect="auto", interpolation="nearest")
     plt.colorbar(label="Peso / similitud")
     plt.xticks([], [])
     plt.yticks([], [])
-    plt.title(f"Matriz de adyacencia - {dataset} {year}")
-    plt.tight_layout()
-    plt.savefig(png_path, dpi=300)
-    plt.close()
 
-    return png_path
+    ds = meta.get("dataset", "")
+    sheet = meta.get("sheet", "")
+    if str(sheet).isdigit():
+        subtitle = f"Año {sheet}"
+    else:
+        subtitle = str(sheet)
+
+    if ds == "GLOBAL":
+        prefix = "Matriz de adyacencia - Red global"
+    elif ds == "RISK":
+        prefix = "Matriz de adyacencia - Red de riesgo"
+    elif ds == "RETURN":
+        prefix = "Matriz de adyacencia - Red de rentabilidad"
+    else:
+        prefix = f"Matriz de adyacencia - {ds}"
+
+    plt.title(f"{prefix}\n{subtitle}")
+    plt.tight_layout()
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=300)
+    plt.close()
 
 
 # =====================
 # 中心性时间序列
 # =====================
 
-def generate_centrality_timeseries(nodes_with_stress: pd.DataFrame, dataset: str) -> Path:
-    df = nodes_with_stress[nodes_with_stress["dataset"] == dataset].copy()
-    # 有些 Year 列为空，使用 'year' 替代
-    if "year" in df.columns and df["Year"].isna().all():
-        df["Year"] = df["year"]
-    df["Year"] = df["Year"].astype(int)
+def generate_centrality_timeseries(
+    centrality_records: pd.DataFrame,
+    dataset: str,
+    out_path: str,
+    top_n: int = TOP_N_CENTRAL,
+) -> None:
+    df = centrality_records[centrality_records["dataset"] == dataset].copy()
+    if df.empty:
+        return
 
-    # 按公司计算 eigenvector_adj 的平均值，选 Top N
-    mean_ec = (
-        df.groupby("Code")["eigenvector_adj"]
+    df["year"] = df["year"].astype(int)
+
+    mean_ev = (
+        df.groupby("node")["eigenvector"]
         .mean()
         .sort_values(ascending=False)
-        .head(TOP_N_CENTRAL)
+        .head(top_n)
     )
-    top_codes = mean_ec.index.tolist()
-
-    sub = df[df["Code"].isin(top_codes)].copy()
-    sub = sub.sort_values(["Code", "Year"])
-
-    out_dir = ensure_output_dir("timeseries")
-    png_path = out_dir / f"centrality_timeseries_{dataset}.png"
+    top_nodes = mean_ev.index.tolist()
+    sub = df[df["node"].isin(top_nodes)].copy()
+    if sub.empty:
+        return
 
     plt.figure(figsize=(7, 4))
-    for code in top_codes:
-        tmp = sub[sub["Code"] == code]
-        plt.plot(tmp["Year"], tmp["eigenvector_adj"], marker="o", linewidth=1, label=code)
+    for node in top_nodes:
+        tmp = sub[sub["node"] == node]
+        plt.plot(
+            tmp["year"],
+            tmp["eigenvector"],
+            marker="o",
+            linewidth=1,
+            label=tmp["empresa"].iloc[0] if not tmp["empresa"].isna().all() else node,
+        )
 
     plt.xlabel("Año")
-    plt.ylabel("Centralidad ajustada (eigenvector_adj)")
-    plt.title(f"Top {TOP_N_CENTRAL} empresas por centralidad - {dataset}")
+    plt.ylabel("Centralidad de vector propio")
+    plt.title(f"Top {len(top_nodes)} empresas por centralidad - {dataset}")
     plt.legend(fontsize=6, ncol=2)
     plt.tight_layout()
-    plt.savefig(png_path, dpi=300)
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=300)
     plt.close()
 
-    return png_path
 
+# =====================
+# 主流程
+# =====================
 
-def main():
-    print("=== 方案5：矩阵 & 中心性时间序列 - 批量生成开始 ===")
+def main() -> None:
+    ensure_dirs()
 
-    # 1) 邻接矩阵热力图
-    for dataset in DATASETS:
-        for year in YEARS:
-            try:
-                print(f"[{dataset} {year}] 生成邻接矩阵热力图...")
-                png_path = generate_adjacency_heatmap(dataset, year)
-                print(f"  -> PNG: {png_path}")
-            except FileNotFoundError as e:
-                print(f"  !! 跳过（缺少文件）: {e}")
-            except Exception as e:
-                print(f"  !! 跳过（其他错误）: {e}")
+    centrality_rows: List[Dict[str, object]] = []
 
-    # 2) 中心性时间序列
-    nodes_all = load_nodes_all()
-    for dataset in DATASETS:
-        try:
-            print(f"[{dataset}] 生成中心性时间序列...")
-            png_path = generate_centrality_timeseries(nodes_all, dataset)
-            print(f"  -> PNG: {png_path}")
-        except Exception as e:
-            print(f"  !! 跳过（错误）: {e}")
+    for dataset, path in DATASETS:
+        if not os.path.exists(path):
+            print(f"[WARN] File not found: {path}")
+            continue
 
-    print("=== 完成 ===")
+        xls = pd.ExcelFile(path)
+        for sheet in xls.sheet_names:
+            df = pd.read_excel(path, sheet_name=sheet)
+            G, meta = bn.build_company_graph(df, dataset, sheet, bn.CORR_THRESHOLD)
+            if G is None:
+                continue
+
+            ev = compute_eigenvector(G)
+            meta = dict(meta)
+            meta["dataset"] = dataset
+            meta["sheet"] = sheet
+
+            fname = f"{dataset.lower()}_{bn.sanitize_filename(sheet)}_adjacency.png"
+            out_png = os.path.join(HEATMAP_DIR, fname)
+            generate_adjacency_heatmap(G, meta, ev, out_png)
+            print(f"[OK] Heatmap guardado: {out_png}")
+
+            if str(sheet).isdigit():
+                year_val = int(sheet)
+                for node in G.nodes():
+                    centrality_rows.append(
+                        {
+                            "dataset": dataset,
+                            "year": year_val,
+                            "node": node,
+                            "empresa": G.nodes[node].get("empresa", node),
+                            "eigenvector": ev.get(node, 0.0),
+                        }
+                    )
+
+    if centrality_rows:
+        centrality_df = pd.DataFrame(centrality_rows)
+        for dataset, _ in DATASETS:
+            out_png = os.path.join(
+                TIMESERIES_DIR,
+                f"centrality_timeseries_{dataset.lower()}.png",
+            )
+            generate_centrality_timeseries(centrality_df, dataset, out_png)
+            print(f"[OK] Serie temporal guardada: {out_png}")
+    else:
+        print("[WARN] No se han acumulado datos de centralidad para generar las series.")
 
 
 if __name__ == "__main__":
