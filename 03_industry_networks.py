@@ -1,548 +1,347 @@
 """
 build_industry_networks.py
 
-功能：
-基于“超级节点（Super-nodes）”理论构建产业网络。
-1. 读取公司层面的财务数据。
-2. 读取行业分类数据（支持多种编码格式，防止乱码）。
-3. 按行业（Industry）聚合数据：计算每个行业所有公司的指标平均值（质心）。
-4. 构建网络：
-   - 节点：行业（Industry）
-   - 连边：行业平均向量之间的相似度（基于欧氏距离）
-   - 节点大小：反映该行业包含的公司数量（权重）
+在原有 build_networks.py 的基础上，把公司网络按“行业（new_industry）”聚合：
+- 节点：行业
+- 特征：该行业内所有公司的财务/风险/收益指标的截面平均值
 
 输出：
-- 静态 PNG 图片（按年份）
-- 动态 HTML 交互图（按年份聚合动画）
-- Excel 网络指标分析报告
+1) 行业网络静态 PNG（每年 + AVG_BY_COMPANY + WAVG_BY_COMPANY，GLOBAL / RISK / RETURN）
+2) 行业网络按年份的动态 HTML（*_industry_dynamic_years.html）
+3) 基于 GLOBAL 的“行业-年份-变量”网络 + PNG + 动态 HTML
+   (global_industry_dynamic_variables.html)
+4) 所有行业网络的节点 & 整体指标：network_metrics_industry.xlsx
+
+关键点：
+- 完全复用 build_networks.py 中的标准化、距离、相似度、相关性阈值逻辑，
+  只是在建图前把公司按 new_industry 聚合。
+- 行业映射来自 industrial.xlsx，要求至少包含：
+    - company_code  （公司代码，如 0001.HK）
+    - new_industry  （行业名，已是你整理好的聚合口径）
 """
 
 import os
-import math
-import os
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
-import networkx as nx
-import matplotlib.pyplot as plt
-import matplotlib.cm as cm
-import plotly.graph_objects as go
-from sklearn.preprocessing import MinMaxScaler
 
-# ---------------- CONFIGURATION ---------------- #
+import build_networks as bn  # 直接复用原脚本中的函数
 
-# 输入文件配置（与主应用保持一致）
-DATA_FILES = {
-    "GLOBAL": "Mercados_company_means_FIXED.xlsx",
-    "RISK":   "RISK.xlsx",
-    "RETURN": "RETURN.xlsx",
-}
 
-# 行业与市值映射文件（Excel），用户额外提供
-INDUSTRY_FILE = "industrial.xlsx"
+# ---------------- 路径 & 基本配置 ---------------- #
 
-# 相似度阈值配置
-# 由于聚合后的行业数据比单家公司数据更平滑，相关性通常更高
-SIM_THRESHOLD = 0.85  
+BASE_DIR = Path(__file__).resolve().parent
 
-# 输出目录
-OUTPUT_DIR = "output_industry_networks"
-PNG_DIR = os.path.join(OUTPUT_DIR, "png")
-HTML_DIR = os.path.join(OUTPUT_DIR, "html")
-METRICS_FILE = os.path.join(OUTPUT_DIR, "Industry_Network_Metrics.xlsx")
+# 原数据文件（保持和 build_networks.py 一致）
+FULL_EXCEL = BASE_DIR / "Mercados_company_means_FIXED.xlsx"
+RISK_EXCEL = BASE_DIR / "RISK.xlsx"
+RETURN_EXCEL = BASE_DIR / "RETURN.xlsx"
 
-# 创建目录
-os.makedirs(PNG_DIR, exist_ok=True)
-os.makedirs(HTML_DIR, exist_ok=True)
+# 行业映射文件：company_code -> new_industry
+INDUSTRY_EXCEL = BASE_DIR / "industrial.xlsx"
+INDUSTRY_SHEET_NAME = None  # 若为 None，则使用第一个 sheet
 
-# ---------------- DATA LOADING & PROCESSING ---------------- #
+# 输出目录（和原 output 区分开）
+OUTPUT_DIR = BASE_DIR / "output_industry"
+PNG_DIR = OUTPUT_DIR / "png"
+HTML_DIR = OUTPUT_DIR / "html"
+METRICS_FILE = OUTPUT_DIR / "network_metrics_industry.xlsx"
 
-def read_table_robust(filepath):
+
+# ---------------- 工具函数 ---------------- #
+
+def ensure_dirs():
+    """创建输出目录。"""
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    PNG_DIR.mkdir(exist_ok=True, parents=True)
+    HTML_DIR.mkdir(exist_ok=True, parents=True)
+
+
+def load_industry_mapping(
+    path: Path = INDUSTRY_EXCEL,
+    sheet_name: str | None = INDUSTRY_SHEET_NAME
+) -> pd.DataFrame:
     """
-    尝试读取 Excel 或 CSV（多种编码），返回 DataFrame 或 None。
-    允许用户提供 xlsx 形式的行业/市值对照表。
+    读取 industrial.xlsx，返回 Code -> new_industry 映射表。
+
+    预期列：
+        company_code   公司代码（与各 Excel 中 Code 对应）
+        new_industry   行业名称（已是你希望使用的聚合行业）
     """
-    if not os.path.exists(filepath):
-        print(f"[ERROR] File not found: {filepath}")
+    xls = pd.ExcelFile(path)
+    sh = sheet_name or xls.sheet_names[0]
+    df = pd.read_excel(path, sheet_name=sh)
+
+    if "company_code" not in df.columns or "new_industry" not in df.columns:
+        raise ValueError(
+            "industrial.xlsx 必须至少包含列 'company_code' 和 'new_industry'"
+        )
+
+    map_df = (
+        df[["company_code", "new_industry"]]
+        .dropna()
+        .drop_duplicates()
+    )
+    return map_df
+
+
+def aggregate_sheet_to_industry(
+    df_sheet: pd.DataFrame,
+    ind_map: pd.DataFrame
+) -> pd.DataFrame | None:
+    """
+    将单个 sheet（公司层面）按行业聚合成“行业表”。
+
+    步骤：
+      1) 按 Code 连接 industry 映射 -> 得到 new_industry
+      2) 丢弃无行业的公司
+      3) 对每个 new_industry，在所有数值变量上取均值
+      4) 生成行业层面的 DataFrame：
+           - empresa = new_industry  (用于标签)
+           - Code   = new_industry  (作为网络节点 ID)
+           - 其余列为各数值变量的行业均值
+           - n_companies = 该行业内公司数
+    """
+    # 要求至少有 empresa, Code（和原脚本一致）
+    if not all(c in df_sheet.columns for c in bn.BASE_COLS):
         return None
 
-    ext = os.path.splitext(filepath)[1].lower()
-    if ext in {".xlsx", ".xls", ".xlsm"}:
-        try:
-            return pd.read_excel(filepath)
-        except Exception as exc:  # pragma: no cover - 兜底
-            print(f"[ERROR] Failed to read Excel {filepath}: {exc}")
-            return None
-
-    encodings = ["utf-8", "gbk", "gb18030", "latin1", "utf-16"]
-    for enc in encodings:
-        try:
-            return pd.read_csv(filepath, encoding=enc)
-        except UnicodeDecodeError:
-            continue
-        except Exception:
-            continue
-    print(f"[ERROR] Could not read {filepath} with any standard encoding.")
-    return None
-
-def load_industry_mapping(filepath):
-    """
-    读取行业 / 市值对照表，返回两个字典：
-      - code_to_industry
-      - code_to_marketcap（可选，没有则为空）
-    支持常见列名：Code / company_code / code，以及 Industry / new_industry。
-    """
-    df = read_table_robust(filepath)
-
-    if df is None:
-        print("[ERROR] Failed to load industry mapping file.")
-        return {}, {}
-
-    try:
-        df.columns = [str(c).strip() for c in df.columns]
-
-        # 可能的列名
-        code_cols = [c for c in df.columns if c.lower() in {"code", "company_code", "ticker"}]
-        industry_cols = [c for c in df.columns if c.lower() in {"industry", "new_industry", "sector"}]
-        mcap_cols = [c for c in df.columns if "market" in c.lower()]
-
-        if not code_cols or not industry_cols:
-            # 后备：使用前两列
-            code_series = df.iloc[:, 0]
-            industry_series = df.iloc[:, 1]
-        else:
-            code_series = df[code_cols[0]]
-            industry_series = df[industry_cols[0]]
-
-        code_to_industry = dict(
-            zip(code_series.astype(str).str.strip(), industry_series.astype(str).str.strip())
-        )
-
-        code_to_mcap = {}
-        if mcap_cols:
-            mcap_series = df[mcap_cols[0]]
-            code_to_mcap = dict(zip(code_series.astype(str).str.strip(), mcap_series))
-
-        print(f"[INFO] Loaded mapping for {len(code_to_industry)} companies (industry map).")
-        return code_to_industry, code_to_mcap
-    except Exception as e:
-        print(f"[ERROR] Error parsing industry mapping: {e}")
-        return {}, {}
-
-def process_year_df(df: pd.DataFrame, industry_map, marketcap_map):
-    """
-    处理单一年份的 DataFrame（来自 Excel sheet）：
-      1. 清理公司代码；
-      2. 映射行业；
-      3. 按行业聚合数值变量均值；
-      4. 返回聚合后的 DataFrame 及用于相似度的特征列。
-    """
-    if df is None or df.empty:
-        return None, None
-
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-
-    # 处理公司代码
-    code_col = None
-    for candidate in ["Code", "code", "company_code", "Ticker", "ticker"]:
-        if candidate in df.columns:
-            code_col = candidate
-            break
-    if code_col is None:
-        return None, None
-
-    df["Code_Clean"] = df[code_col].astype(str).str.strip()
-    df["Industry"] = df["Code_Clean"].map(industry_map)
-    df["MarketCap"] = df["Code_Clean"].map(marketcap_map) if marketcap_map else np.nan
-
-    df_clean = df.dropna(subset=["Industry"]).copy()
-    if df_clean.empty:
-        return None, None
-
-    # 数值列（排除年份等标识列）
-    numeric_cols = df_clean.select_dtypes(include=[np.number]).columns.tolist()
-    numeric_cols = [c for c in numeric_cols if c not in {"Year"}]
-
-    if not numeric_cols:
-        return None, None
-
-    # 行业聚合
-    df_industry_mean = df_clean.groupby("Industry")[numeric_cols].mean()
-    df_industry_count = df_clean.groupby("Industry")["Code_Clean"].count()
-    df_industry_mean["company_count"] = df_industry_count
-
-    # 市值（如果提供）：行业层面的平均值
-    if "MarketCap" in df_industry_mean.columns:
-        df_industry_mean.rename(columns={"MarketCap": "avg_market_cap"}, inplace=True)
-
-    feature_cols = [c for c in df_industry_mean.columns if c != "company_count"]
-    scaler = MinMaxScaler()
-    df_industry_mean[feature_cols] = scaler.fit_transform(df_industry_mean[feature_cols].fillna(0))
-
-    return df_industry_mean, feature_cols
-
-# ---------------- NETWORK CONSTRUCTION ---------------- #
-
-def compute_similarity(vec_a, vec_b):
-    """基于欧氏距离计算相似度: 1 / (1 + distance)"""
-    dist = np.linalg.norm(vec_a - vec_b)
-    return 1.0 / (1.0 + dist)
-
-def build_network_from_aggregated(df_agg, feature_cols, threshold=0.8):
-    """
-    构建网络图
-    df_agg: 索引为 Industry 的 DataFrame
-    feature_cols:用于计算距离的列名列表
-    """
-    G = nx.Graph()
-    
-    industries = df_agg.index.tolist()
-    
-    # 添加节点
-    for ind in industries:
-        count = df_agg.loc[ind, 'company_count']
-        G.add_node(ind, size=count, label=ind)
-    
-    # 添加边
-    n = len(industries)
-    for i in range(n):
-        for j in range(i + 1, n):
-            ind_a = industries[i]
-            ind_b = industries[j]
-            
-            vec_a = df_agg.loc[ind_a, feature_cols].values
-            vec_b = df_agg.loc[ind_b, feature_cols].values
-            
-            sim = compute_similarity(vec_a, vec_b)
-            
-            if sim >= threshold:
-                G.add_edge(ind_a, ind_b, weight=sim)
-                
-    return G
-
-# ---------------- VISUALIZATION ---------------- #
-
-def save_static_plot(G, year, dataset_name):
-    """保存静态 PNG"""
-    plt.figure(figsize=(12, 10))
-    
-    # 布局
-    pos = nx.spring_layout(G, k=0.6, seed=42) # k值大一些，节点分得更开
-    
-    # 节点大小 (根据公司数量缩放)
-    # 避免太小，基础大小200 + 数量*10
-    node_sizes = [200 + nx.get_node_attributes(G, 'size')[node] * 10 for node in G.nodes()]
-    
-    # 节点颜色 (使用度中心性)
-    d = dict(G.degree(weight='weight'))
-    node_colors = list(d.values())
-    
-    # 绘图
-    nx.draw_networkx_nodes(G, pos, node_size=node_sizes, node_color=node_colors, cmap=plt.cm.viridis, alpha=0.9)
-    nx.draw_networkx_edges(G, pos, alpha=0.4, edge_color='gray')
-    
-    # 标签 (行业名称)
-    # 自动调整标签位置防止重叠是个难题，这里简单向上偏移
-    label_pos = {k: (v[0], v[1]+0.05) for k, v in pos.items()}
-    nx.draw_networkx_labels(G, label_pos, font_size=9, font_weight='bold', font_family='sans-serif')
-    
-    plt.title(f"Industry Super-Node Network: {dataset_name} ({year})", fontsize=15)
-    plt.axis('off')
-    
-    filename = os.path.join(PNG_DIR, f"{dataset_name}_{year}.png")
-    plt.savefig(filename, format="PNG", dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"  -> Saved PNG: {filename}")
-
-def calculate_graph_metrics(G, year, dataset_name):
-    """计算网络指标"""
-    if len(G.nodes) == 0:
-        return {}
-        
-    metrics = {
-        "Dataset": dataset_name,
-        "Year": year,
-        "Nodes (Industries)": G.number_of_nodes(),
-        "Edges": G.number_of_edges(),
-        "Density": nx.density(G),
-        "Avg Degree": np.mean([d for n, d in G.degree()]),
-        "Avg Weighted Degree": np.mean([d for n, d in G.degree(weight='weight')]),
-        "Avg Clustering": nx.average_clustering(G, weight='weight'),
-        "Transitivity": nx.transitivity(G)
-    }
-    
-    # 尝试计算连通分量相关指标
-    if nx.is_connected(G):
-        metrics["Avg Path Length"] = nx.average_shortest_path_length(G, weight='weight')
-        metrics["Diameter"] = nx.diameter(G)
-    elif len(G.nodes) > 1:
-        # 如果不连通，计算最大连通子图
-        largest_cc = max(nx.connected_components(G), key=len)
-        if len(largest_cc) > 1:
-            subG = G.subgraph(largest_cc)
-            metrics["Avg Path Length"] = nx.average_shortest_path_length(subG, weight='weight')
-            metrics["Diameter"] = nx.diameter(subG)
-        else:
-            metrics["Avg Path Length"] = 0
-            metrics["Diameter"] = 0
-    else:
-        metrics["Avg Path Length"] = 0
-        metrics["Diameter"] = 0
-        
-    return metrics
-
-# ---------------- DYNAMIC HTML GENERATION ---------------- #
-
-def build_dynamic_html_timeline(graphs_dict, dataset_name, output_path):
-    """
-    生成带时间滑块的 Plotly HTML
-    graphs_dict: { year: NetworkX Graph }
-    """
-    years = sorted(graphs_dict.keys())
-    if not years:
-        return
-
-    # 1. 准备基础 Figure
-    fig = go.Figure()
-    
-    frames = []
-    steps = []
-
-    # 先画第一年的（作为初始状态）
-    first_year = years[0]
-    G_first = graphs_dict[first_year]
-    pos_first = nx.spring_layout(G_first, seed=42)
-    
-    edge_x = []
-    edge_y = []
-    for edge in G_first.edges():
-        x0, y0 = pos_first[edge[0]]
-        x1, y1 = pos_first[edge[1]]
-        edge_x.extend([x0, x1, None])
-        edge_y.extend([y0, y1, None])
-
-    node_x = []
-    node_y = []
-    node_text = []
-    node_size = []
-    node_color = []
-    
-    for node in G_first.nodes():
-        x, y = pos_first[node]
-        node_x.append(x)
-        node_y.append(y)
-        # Tooltip 显示信息
-        size_val = G_first.nodes[node].get('size', 10)
-        deg = G_first.degree(node)
-        info = f"Industry: {node}<br>Companies: {size_val}<br>Degree: {deg}"
-        node_text.append(info)
-        node_size.append(math.sqrt(size_val) * 5 + 5) # 调整大小比例
-        node_color.append(deg)
-
-    # 添加初始 Trace (Edges)
-    fig.add_trace(go.Scatter(
-        x=edge_x, y=edge_y,
-        line=dict(width=0.5, color='#888'),
-        hoverinfo='none',
-        mode='lines',
-        name='Relations'
-    ))
-
-    # 添加初始 Trace (Nodes)
-    fig.add_trace(go.Scatter(
-        x=node_x, y=node_y,
-        mode='markers+text',
-        hoverinfo='text',
-        text=[n for n in G_first.nodes()], # 节点上直接显示名字
-        textposition="top center",
-        hovertext=node_text,
-        marker=dict(
-            showscale=True,
-            colorscale='YlGnBu',
-            reversescale=True,
-            color=node_color,
-            size=node_size,
-            colorbar=dict(
-                thickness=15,
-                title=dict(text='Degree Centrality', side='right'),
-                xanchor='left'
-            ),
-            line_width=2
-        ),
-        name='Industries'
-    ))
-
-    # 3. 构建 Frames (每一年的数据)
-    for year in years:
-        G = graphs_dict[year]
-        pos = nx.spring_layout(G, seed=42) # 重新计算布局
-        
-        e_x, e_y = [], []
-        for edge in G.edges():
-            x0, y0 = pos[edge[0]]
-            x1, y1 = pos[edge[1]]
-            e_x.extend([x0, x1, None])
-            e_y.extend([y0, y1, None])
-            
-        n_x, n_y = [], []
-        n_text_hover = []
-        n_labels = []
-        n_sizes = []
-        n_colors = []
-        
-        for node in G.nodes():
-            x, y = pos[node]
-            n_x.append(x)
-            n_y.append(y)
-            size_val = G.nodes[node].get('size', 10)
-            deg = G.degree(node)
-            n_text_hover.append(f"Year: {year}<br>Industry: {node}<br>Companies: {size_val}<br>Degree: {deg}")
-            n_labels.append(node)
-            n_sizes.append(math.sqrt(size_val) * 5 + 5)
-            n_colors.append(deg)
-            
-        frame = go.Frame(
-            data=[
-                go.Scatter(x=e_x, y=e_y), # Update edges
-                go.Scatter(
-                    x=n_x, y=n_y, 
-                    text=n_labels,
-                    hovertext=n_text_hover,
-                    marker=dict(color=n_colors, size=n_sizes)
-                ) # Update nodes
-            ],
-            name=str(year)
-        )
-        frames.append(frame)
-        
-        # Slider step
-        step = dict(
-            method="animate",
-            args=[
-                [str(year)],
-                {"frame": {"duration": 1000, "redraw": True},
-                 "mode": "immediate",
-                 "transition": {"duration": 500}}
-            ],
-            label=str(year)
-        )
-        steps.append(step)
-
-    fig.frames = frames
-
-    # 4. 布局设置 (Slider & Buttons)
-    sliders = [dict(
-        active=0,
-        currentvalue={"prefix": "Year: "},
-        pad={"t": 50},
-        steps=steps
-    )]
-
-    fig.update_layout(
-        title=f"Dynamic Industry Network - {dataset_name}",
-        showlegend=False,
-        width=1000,
-        height=800,
-        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-        updatemenus=[dict(
-            type="buttons",
-            showactive=False,
-            x=0.1, y=0, xanchor="right", yanchor="top",
-            pad={"t": 50, "r": 10},
-            buttons=[dict(label="Play",
-                          method="animate",
-                          args=[None, {"frame": {"duration": 1000, "redraw": True}, 
-                                       "fromcurrent": True, "transition": {"duration": 500}}]),
-                     dict(label="Pause",
-                          method="animate",
-                          args=[[None], {"frame": {"duration": 0, "redraw": False}, 
-                                         "mode": "immediate", "transition": {"duration": 0}}])]
-        )],
-        sliders=sliders
+    df = df_sheet.merge(
+        ind_map,
+        left_on="Code",
+        right_on="company_code",
+        how="left"
     )
 
-    fig.write_html(output_path)
-    print(f"  -> Saved Dynamic HTML: {output_path}")
+    before = df.shape[0]
+    df = df.dropna(subset=["new_industry"])
+    after = df.shape[0]
 
-# ---------------- MAIN EXECUTION ---------------- #
+    print(f"  - rows with industry: {after}/{before}")
+    if after < 2:
+        return None
+
+    # 选数值列做聚合
+    num_cols = [
+        c for c in df.columns
+        if pd.api.types.is_numeric_dtype(df[c])
+    ]
+    # Year 是常数列，保留与否问题不大；留着也 OK，会被标准化成 0 向量
+    grouped = df.groupby("new_industry")
+
+    agg = grouped[num_cols].mean().reset_index()
+    # 行业内公司数量
+    agg["n_companies"] = grouped.size().values
+
+    # 对齐 build_company_graph 的格式：BASE_COLS = ["empresa", "Code"]
+    agg = agg.rename(columns={"new_industry": "empresa"})
+    agg["Code"] = agg["empresa"]
+
+    # 确保 empresa / Code 在前
+    cols = ["empresa", "Code"] + [
+        c for c in agg.columns if c not in ["empresa", "Code"]
+    ]
+    agg = agg[cols]
+
+    return agg
+
+
+def make_industry_panel_for_var(
+    panel_ind: pd.DataFrame,
+    var_name: str
+) -> pd.DataFrame:
+    """
+    从公司层面的 panel（已接上 new_industry）生成
+    该变量的“行业-年份”面板数据，用于按变量构建行业网络。
+
+    返回列：
+        empresa  (行业名)
+        Code     (行业名，同 empresa)
+        Year
+        var_name
+    """
+    df = panel_ind[["new_industry", "Year", var_name]].copy()
+    df = df.dropna(subset=["new_industry", "Year"])
+    if df.empty:
+        return pd.DataFrame(columns=["empresa", "Code", "Year", var_name])
+
+    df["Year"] = df["Year"].astype(int)
+
+    grp = df.groupby(["new_industry", "Year"])[var_name].mean().reset_index()
+    grp = grp.rename(columns={"new_industry": "empresa"})
+    grp["Code"] = grp["empresa"]
+
+    cols = ["empresa", "Code", "Year", var_name]
+    return grp[cols]
+
+
+# ---------------- 主函数：构建行业网络 ---------------- #
 
 def main():
-    print("--- Starting Industry Network Generation ---")
+    ensure_dirs()
 
-    # 1. 加载行业映射
-    print(f"Loading industry map from {INDUSTRY_FILE}...")
-    industry_map, marketcap_map = load_industry_mapping(INDUSTRY_FILE)
-    if not industry_map:
-        print("Error: Could not load industry map (Empty). Exiting.")
-        return
+    ind_map = load_industry_mapping()
+    print(
+        f"[INFO] Loaded industry map: "
+        f"{ind_map['new_industry'].nunique()} industries, "
+        f"{len(ind_map)} rows."
+    )
 
-    all_metrics = []
+    datasets = [
+        ("GLOBAL", FULL_EXCEL),
+        ("RISK",   RISK_EXCEL),
+        ("RETURN", RETURN_EXCEL),
+    ]
 
-    # 2. 遍历三个数据集 (GLOBAL, RISK, RETURN) - 使用 Excel 年份 sheet
-    for ds_name, excel_path in DATA_FILES.items():
-        print(f"\nProcessing Dataset: {ds_name}")
+    all_node_metrics: list[pd.DataFrame] = []
+    all_graph_metrics: list[dict] = []
 
-        if not os.path.exists(excel_path):
-            print(f"  [WARN] File not found: {excel_path}")
-            continue
+    # 保存用于动态 HTML（按年份）的结构
+    graphs_by_dataset_and_year: dict[str, dict[str, tuple]] = {
+        "GLOBAL": {},
+        "RISK": {},
+        "RETURN": {},
+    }
 
-        xls = pd.ExcelFile(excel_path)
-        year_sheets = [sh for sh in xls.sheet_names if str(sh).isdigit()]
-        graphs_by_year = {}
+    var_graphs: dict[str, tuple] = {}  # 行业-变量网络（只对 GLOBAL）
 
-        for sh in sorted(year_sheets, key=lambda s: int(s)):
-            print(f"  > Processing Year: {sh}")
-            df_year = pd.read_excel(excel_path, sheet_name=sh)
+    # ---------- 1. 各数据集 / 各年份的“行业网络” ---------- #
 
-            df_agg, features = process_year_df(df_year, industry_map, marketcap_map)
+    for ds_name, path in datasets:
+        path = Path(path)  # 保险起见转成 Path
+        print(f"\n[INFO] Building industry networks for {ds_name} ({path.name})")
 
-            if df_agg is None or df_agg.empty:
-                print(f"    Skipping {sh} (No valid data after merging)")
+        xls = pd.ExcelFile(path)
+        for sh in xls.sheet_names:
+            print(f"  -> sheet: {sh}")
+            df_sheet = pd.read_excel(path, sheet_name=sh)
+
+            df_ind = aggregate_sheet_to_industry(df_sheet, ind_map)
+            if df_ind is None or df_ind.shape[0] < 2:
+                print("     (skip: not enough industries after aggregation)")
                 continue
 
-            G = build_network_from_aggregated(df_agg, features, threshold=SIM_THRESHOLD)
-            graphs_by_year[str(sh)] = G
+            # 这里 dataset 名字用 f"{ds_name}_IND" 方便在指标里区分
+            G, meta = bn.build_company_graph(
+                df_ind,
+                dataset_name=f"{ds_name}_IND",
+                sheet_name=sh,
+                corr_threshold=bn.CORR_THRESHOLD,
+            )
+            if G is None or G.number_of_nodes() == 0:
+                print("     (skip: empty graph)")
+                continue
 
-            save_static_plot(G, sh, ds_name)
-            m = calculate_graph_metrics(G, sh, ds_name)
-            all_metrics.append(m)
+            # 静态 PNG
+            fname = f"{ds_name.lower()}_IND_{bn.sanitize_filename(sh)}.png"
+            out_png = PNG_DIR / fname
+            bn.plot_static_graph(G, meta, str(out_png))
 
-        if graphs_by_year:
-            html_path = os.path.join(HTML_DIR, f"{ds_name}_dynamic_industry.html")
-            build_dynamic_html_timeline(graphs_by_year, ds_name, html_path)
+            # 网络指标
+            node_df = bn.compute_node_metrics(G, meta)
+            graph_dict = bn.compute_graph_metrics(G, meta)
+            all_node_metrics.append(node_df)
+            all_graph_metrics.append(graph_dict)
 
-    # 4. 保存所有指标到 Excel
-    if all_metrics:
-        metrics_df = pd.DataFrame(all_metrics)
-        # 调整列顺序
-        cols = [
-            "Dataset",
-            "Year",
-            "Nodes (Industries)",
-            "Edges",
-            "Density",
-            "Avg Degree",
-        ] + [
-            c
-            for c in metrics_df.columns
-            if c
-            not in [
-                "Dataset",
-                "Year",
-                "Nodes (Industries)",
-                "Edges",
-                "Density",
-                "Avg Degree",
-            ]
+            # 动态 HTML（按年份）只记录数字年份的 sheet
+            if sh.isdigit():
+                graphs_by_dataset_and_year[ds_name][sh] = (G, meta)
+
+    # ---------- 2. 基于 GLOBAL 的“按变量的行业网络” ---------- #
+
+    print("\n[INFO] Building variable-level industry networks from GLOBAL panel")
+
+    panel = bn.load_panel_from_full(str(FULL_EXCEL))
+    if not panel.empty:
+        # 接上行业
+        panel_ind = panel.merge(
+            ind_map,
+            left_on="Code",
+            right_on="company_code",
+            how="left"
+        )
+        panel_ind = panel_ind.dropna(subset=["new_industry"])
+
+        # 数值变量：排除基础列和映射列
+        num_cols = [
+            c for c in panel_ind.columns
+            if c not in bn.BASE_COLS
+                      + ["Year", "SourceFile",
+                         "company_code", "company_name", "new_industry"]
+            and pd.api.types.is_numeric_dtype(panel_ind[c])
         ]
-        metrics_df = metrics_df[cols]
-        
-        metrics_df.to_excel(METRICS_FILE, index=False)
-        print(f"\n[SUCCESS] Metrics saved to {METRICS_FILE}")
-    
-    print("\n--- Processing Complete ---")
-    print(f"Check the '{OUTPUT_DIR}' folder for results.")
+        print(f"  - #variables for industry-variable networks: {len(num_cols)}")
+
+        for var in num_cols:
+            print(f"  -> variable: {var}")
+            panel_var = make_industry_panel_for_var(panel_ind, var)
+            if panel_var["empresa"].nunique() < 2:
+                print("     (skip: <2 industries)")
+                continue
+
+            Gv, meta_v = bn.build_variable_graph(
+                panel_var,
+                var_name=var,
+                dataset_name="GLOBAL_IND"
+            )
+            if Gv is None or Gv.number_of_nodes() == 0:
+                print("     (skip: empty graph)")
+                continue
+
+            # 静态 PNG
+            fname = f"GLOBAL_IND_var_{bn.sanitize_filename(var)}.png"
+            out_png = PNG_DIR / fname
+            bn.plot_static_graph(Gv, meta_v, str(out_png))
+
+            # 指标
+            node_df_v = bn.compute_node_metrics(Gv, meta_v)
+            graph_dict_v = bn.compute_graph_metrics(Gv, meta_v)
+            all_node_metrics.append(node_df_v)
+            all_graph_metrics.append(graph_dict_v)
+
+            var_graphs[var] = (Gv, meta_v)
+    else:
+        print("  (panel empty, skip variable-level industry networks)")
+
+    # ---------- 3. 指标写入 Excel ---------- #
+
+    if all_node_metrics and all_graph_metrics:
+        nodes_df_all = pd.concat(all_node_metrics, ignore_index=True)
+        graphs_df_all = pd.DataFrame(all_graph_metrics)
+
+        with pd.ExcelWriter(METRICS_FILE, engine="openpyxl") as writer:
+            nodes_df_all.to_excel(writer, sheet_name="nodes_metrics", index=False)
+            graphs_df_all.to_excel(writer, sheet_name="graphs_summary", index=False)
+
+        print(f"\n[OK] Saved industry network metrics to: {METRICS_FILE}")
+    else:
+        print("\n[WARN] No industry networks built, metrics file not written.")
+
+    # ---------- 4. 行业网络：按年份的动态 HTML ---------- #
+
+    for ds_name, _ in datasets:
+        graphs_year = graphs_by_dataset_and_year.get(ds_name, {})
+        if graphs_year:
+            out_html = HTML_DIR / f"{ds_name.lower()}_industry_dynamic_years.html"
+            # 这里 dataset_name 仍传 'GLOBAL' / 'RISK' / 'RETURN'，
+            # 只是 title 上显示为 "Red Global - Años"，但节点实际是行业。
+            bn.build_animated_years_html(graphs_year, ds_name, str(out_html))
+            print(f"[OK] Industry dynamic HTML (years) for {ds_name}: {out_html}")
+        else:
+            print(f"[INFO] No yearly industry graphs for {ds_name}, skip HTML.")
+
+    # ---------- 5. 行业-变量网络：动态 HTML ---------- #
+
+    if var_graphs:
+        out_html_vars = HTML_DIR / "global_industry_dynamic_variables.html"
+        bn.build_animated_variables_html(var_graphs, str(out_html_vars))
+        print(f"[OK] Industry dynamic HTML (variables): {out_html_vars}")
+    else:
+        print("[INFO] No industry variable-level graphs, skip HTML.")
+
+    print("\n[DONE] Industry-aggregated networks construction finished.")
+
 
 if __name__ == "__main__":
     main()
