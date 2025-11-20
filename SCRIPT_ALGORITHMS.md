@@ -42,18 +42,18 @@
 - 代表节点只取社区内中心性最高的少数公司，这些公司之间的边仍需通过“最强边”过滤（Top 10%）。
 - 如果代表点之间的相似度低于分位阈值，或原始社区内部边本就稀疏，过滤后会出现同一社区（相同颜色）节点间无连接的情况；代码在这种情况下保留节点但不强制添加边，以真实反映强关系结构。
 
-## 03_industry_networks.py（方案 3：产业聚合网络）
-- **输入**：年度 Excel 工作表 + 行业/市值映射 `industrial.xlsx`。
-- **映射读取**：容错读取多种编码/格式；识别 `Code`/`company_code`/`ticker` 等列映射到 `Industry`，可选读取市值列。
+## 03_industry_networks.py（方案 3：行业聚合 + Drill-down）
+- **输入**：年度 Excel 工作表与行业映射表 `industrial.xlsx`（`company_code` ↔ `new_industry`）。
 - **行业聚合**：
-  - 将公司代码映射到行业，缺失行业的记录被丢弃。
-  - 对行业内数值列求平均，统计 `company_count`，若有市值则求行业平均市值。
-  - 使用 Min-Max 归一化保证各特征可比。
-- **边构建**：行业特征向量的欧氏距离转为相似度 \(1/(1+d)\)，阈值 `SIM_THRESHOLD=0.85` 以上才连边；节点大小与公司数量成比例。
-- **输出**：
-  - 每年 Matplotlib 静态 PNG（节点颜色按度数渐变）。
-  - Plotly 动态年份滑块 HTML。
-  - 指标写入 `output_industry_networks/Industry_Network_Metrics.xlsx`。
+  - 每个年份的 sheet 先按 `Code` 关联行业，缺失行业归为 `Other`；对行业内数值列求均值并保留公司数量 `n_companies`。
+  - 使用与 `build_networks.py` 相同的相似度与相关性阈值（相似度=\(1/(1+d)\)，`CORR_THRESHOLD=0.3`）构建“行业网络”。
+- **行业内部网络**：
+  - 对每个“年份 × 行业”子集再次调用 `build_company_graph`，生成行业内部的公司网络。
+- **可视化**：
+  - 静态 PNG：行业网络与对应的内部公司网络都会输出到 `output_industrial/png`，命名包含数据集、行业与年份。
+  - 动态 HTML：在 `output_industrial/html` 生成带年份滑块的行业网络动图，并支持点击行业节点查看右侧的内部公司网络（drill-down）。
+- **指标与汇总**：
+  - 全部行业网络与内部网络的节点/整体指标写入 `output_industrial/industry_network_metrics.xlsx`，与基础脚本的指标格式保持一致，便于统一对比。
 
 ## 04_variable_snapshots.py（方案 4：关键变量 × 关键年份）
 - **输入**：整体面板数据（`FULL_EXCEL` 聚合），关注变量列表与年份列表。

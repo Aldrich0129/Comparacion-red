@@ -47,6 +47,10 @@ spec.loader.exec_module(bn)
 # 复用原脚本中的配置与函数
 CORR_THRESHOLD = bn.CORR_THRESHOLD          # 相关性阈值
 BUILD_COMPANY_GRAPH = bn.build_company_graph
+COMPUTE_NODE_METRICS = bn.compute_node_metrics
+COMPUTE_GRAPH_METRICS = bn.compute_graph_metrics
+PLOT_STATIC_GRAPH = bn.plot_static_graph
+SANITIZE_FILENAME = bn.sanitize_filename
 
 # ----------------- 本脚本配置 ----------------- #
 
@@ -55,8 +59,15 @@ GLOBAL_FILE   = BASE_DIR / "Mercados_company_means_FIXED.xlsx"
 RISK_FILE     = BASE_DIR / "RISK.xlsx"
 RETURN_FILE   = BASE_DIR / "RETURN.xlsx"
 
-OUTPUT_DIR = BASE_DIR                       # 直接输出到当前目录
-# 也可以改成 OUTPUT_DIR = BASE_DIR / "output_html"
+OUTPUT_DIR = BASE_DIR / "output_industrial"
+HTML_DIR = OUTPUT_DIR / "html"
+PNG_DIR = OUTPUT_DIR / "png"
+METRICS_FILE = OUTPUT_DIR / "industry_network_metrics.xlsx"
+
+
+def ensure_dirs():
+    HTML_DIR.mkdir(parents=True, exist_ok=True)
+    PNG_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ============================================================
@@ -200,7 +211,7 @@ def build_industry_frames_for_dataset(
     excel_path: Path,
     dataset_name: str,
     industry_map: pd.DataFrame
-) -> Tuple[Dict[str, nx.Graph], Dict[str, Dict[str, nx.Graph]]]:
+) -> Tuple[Dict[str, Tuple[nx.Graph, dict]], Dict[str, Dict[str, Tuple[nx.Graph, dict]]]]:
     """
     对一个数据集（GLOBAL / RISK / RETURN）：
       - 读取每个年份的 sheet
@@ -212,8 +223,8 @@ def build_industry_frames_for_dataset(
       inner_graphs:  {year_str -> {industry_name -> G_inner_companies}}
     """
     xls = pd.ExcelFile(excel_path)
-    graphs_years: Dict[str, nx.Graph] = {}
-    inner_graphs: Dict[str, Dict[str, nx.Graph]] = {}
+    graphs_years: Dict[str, Tuple[nx.Graph, dict]] = {}
+    inner_graphs: Dict[str, Dict[str, Tuple[nx.Graph, dict]]] = {}
 
     for sheet in xls.sheet_names:
         # 只用纯数字年份的 sheet（2006, 2007, ...）
@@ -233,7 +244,7 @@ def build_industry_frames_for_dataset(
         if G_ind is None or G_ind.number_of_nodes() == 0:
             continue
 
-        graphs_years[sheet] = G_ind
+        graphs_years[sheet] = (G_ind, meta_ind)
 
         # 行业内部公司网络（一个行业一个子图）
         inner_dict: Dict[str, nx.Graph] = {}
@@ -250,7 +261,7 @@ def build_industry_frames_for_dataset(
                 corr_threshold=CORR_THRESHOLD,
             )
             if G_in is not None and G_in.number_of_nodes() > 0:
-                inner_dict[ind_name] = G_in
+                inner_dict[ind_name] = (G_in, meta_in)
 
         inner_graphs[sheet] = inner_dict
 
@@ -262,7 +273,7 @@ def build_industry_frames_for_dataset(
 # ============================================================
 
 def build_industry_animated_figure(
-    graphs_years: Dict[str, nx.Graph],
+    graphs_years: Dict[str, Tuple[nx.Graph, dict]],
     dataset_name: str
 ) -> go.Figure:
     """
@@ -275,12 +286,12 @@ def build_industry_animated_figure(
 
     init_year = years[0]
 
-    edge0, node0 = graph_to_traces(graphs_years[init_year], label_attr="empresa")
+    edge0, node0 = graph_to_traces(graphs_years[init_year][0], label_attr="empresa")
 
     # 每个年份一帧
     frames = []
     for y in years:
-        edge_t, node_t = graph_to_traces(graphs_years[y], label_attr="empresa")
+        edge_t, node_t = graph_to_traces(graphs_years[y][0], label_attr="empresa")
         frames.append(
             go.Frame(
                 data=[edge_t, node_t],
@@ -383,7 +394,7 @@ def build_industry_animated_figure(
 # ============================================================
 
 def build_company_figures(
-    inner_graphs: Dict[str, Dict[str, nx.Graph]]
+    inner_graphs: Dict[str, Dict[str, Tuple[nx.Graph, dict]]]
 ) -> Dict[str, Dict[str, dict]]:
     """
     把 inner_graphs 转成可直接序列化到 JSON 的 Plotly dict：
@@ -393,7 +404,8 @@ def build_company_figures(
 
     for year, ind_dict in inner_graphs.items():
         year_dict: Dict[str, dict] = {}
-        for ind_name, G in ind_dict.items():
+        for ind_name, tpl in ind_dict.items():
+            G, _meta = tpl
             edge_t, node_t = graph_to_traces(G, label_attr="empresa")
             if edge_t is None or node_t is None:
                 continue
@@ -622,7 +634,11 @@ def build_drilldown_html(
 # ============================================================
 
 def main():
+    ensure_dirs()
     industry_map = pd.read_excel(INDUSTRY_FILE)
+
+    all_node_metrics = []
+    all_graph_metrics = []
 
     datasets = [
         ("GLOBAL", GLOBAL_FILE, "global_industry_drilldown_years.html"),
@@ -639,15 +655,44 @@ def main():
         )
         print(f"{ds_name}: años con red de sectores -> {sorted(graphs_years.keys())}")
 
+        # 静态 PNG：行业网络
+        for year, (G_ind, meta_ind) in graphs_years.items():
+            png_name = f"{ds_name.lower()}_industry_{SANITIZE_FILENAME(year)}.png"
+            out_png = PNG_DIR / png_name
+            PLOT_STATIC_GRAPH(G_ind, meta_ind, out_png)
+            all_node_metrics.append(COMPUTE_NODE_METRICS(G_ind, meta_ind))
+            all_graph_metrics.append(COMPUTE_GRAPH_METRICS(G_ind, meta_ind))
+
+        # 静态 PNG：行业内部公司网络
+        for year, ind_dict in inner_graphs.items():
+            for ind_name, (G_inner, meta_inner) in ind_dict.items():
+                png_name = (
+                    f"{ds_name.lower()}_industry_{SANITIZE_FILENAME(ind_name)}"
+                    f"_{SANITIZE_FILENAME(year)}.png"
+                )
+                out_png = PNG_DIR / png_name
+                PLOT_STATIC_GRAPH(G_inner, meta_inner, out_png)
+                all_node_metrics.append(COMPUTE_NODE_METRICS(G_inner, meta_inner))
+                all_graph_metrics.append(COMPUTE_GRAPH_METRICS(G_inner, meta_inner))
+
         fig_ind = build_industry_animated_figure(graphs_years, ds_name)
         company_figs = build_company_figures(inner_graphs)
 
-        out_html = OUTPUT_DIR / html_name
+        out_html = HTML_DIR / html_name
         build_drilldown_html(fig_ind, company_figs, ds_name, out_html)
 
         print(f"{ds_name}: HTML con drill-down generado -> {out_html}")
 
-    print("\nTodo listo. Puedes在 Streamlit 中用 components.html 嵌入上述 HTML 文件。")
+    # 汇总指标
+    if all_node_metrics and all_graph_metrics:
+        nodes_df = pd.concat(all_node_metrics, ignore_index=True)
+        graphs_df = pd.DataFrame(all_graph_metrics)
+        with pd.ExcelWriter(METRICS_FILE, engine="openpyxl") as writer:
+            graphs_df.to_excel(writer, sheet_name="graphs_summary", index=False)
+            nodes_df.to_excel(writer, sheet_name="nodes_metrics", index=False)
+        print(f"[OK] Métricas guardadas en {METRICS_FILE}")
+
+    print("\nTodo listo. Los archivos se encuentran en output_industrial/html y output_industrial/png 。Puedes在 Streamlit 中用 components.html 嵌入上述 HTML 文件。")
 
 
 if __name__ == "__main__":
