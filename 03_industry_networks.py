@@ -18,8 +18,8 @@ build_industry_networks.py
 """
 
 import os
-import glob
 import math
+import os
 import numpy as np
 import pandas as pd
 import networkx as nx
@@ -30,13 +30,14 @@ from sklearn.preprocessing import MinMaxScaler
 
 # ---------------- CONFIGURATION ---------------- #
 
-# 输入文件配置
+# 输入文件配置（与主应用保持一致）
 DATA_FILES = {
     "GLOBAL": "Mercados_company_means_FIXED.xlsx",
     "RISK":   "RISK.xlsx",
-    "RETURN": "RETURN.xlsx"
+    "RETURN": "RETURN.xlsx",
 }
 
+# 行业与市值映射文件（Excel），用户额外提供
 INDUSTRY_FILE = "industrial.xlsx"
 
 # 相似度阈值配置
@@ -55,14 +56,27 @@ os.makedirs(HTML_DIR, exist_ok=True)
 
 # ---------------- DATA LOADING & PROCESSING ---------------- #
 
-def read_csv_robust(filepath):
-    """尝试多种编码读取 CSV 文件"""
-    encodings = ['utf-8', 'gbk', 'gb18030', 'latin1', 'utf-16']
+def read_table_robust(filepath):
+    """
+    尝试读取 Excel 或 CSV（多种编码），返回 DataFrame 或 None。
+    允许用户提供 xlsx 形式的行业/市值对照表。
+    """
+    if not os.path.exists(filepath):
+        print(f"[ERROR] File not found: {filepath}")
+        return None
+
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext in {".xlsx", ".xls", ".xlsm"}:
+        try:
+            return pd.read_excel(filepath)
+        except Exception as exc:  # pragma: no cover - 兜底
+            print(f"[ERROR] Failed to read Excel {filepath}: {exc}")
+            return None
+
+    encodings = ["utf-8", "gbk", "gb18030", "latin1", "utf-16"]
     for enc in encodings:
         try:
-            df = pd.read_csv(filepath, encoding=enc)
-            # 简单的检查：如果读出来只有一列，且包含逗号，可能分隔符不对，但这通常是编码问题的前兆
-            return df
+            return pd.read_csv(filepath, encoding=enc)
         except UnicodeDecodeError:
             continue
         except Exception:
@@ -71,99 +85,101 @@ def read_csv_robust(filepath):
     return None
 
 def load_industry_mapping(filepath):
-    """读取行业对照表，返回 {company_code: industry_name} 字典"""
-    df = read_csv_robust(filepath)
-    
+    """
+    读取行业 / 市值对照表，返回两个字典：
+      - code_to_industry
+      - code_to_marketcap（可选，没有则为空）
+    支持常见列名：Code / company_code / code，以及 Industry / new_industry。
+    """
+    df = read_table_robust(filepath)
+
     if df is None:
         print("[ERROR] Failed to load industry mapping file.")
-        return {}
+        return {}, {}
 
     try:
-        # 清理列名
-        df.columns = [c.strip() for c in df.columns]
-        
-        # 确保有关键列
-        if 'company_code' not in df.columns or 'new_industry' not in df.columns:
-            print("Warning: Industry file columns mismatch. Trying index 0 and 2.")
-            # 尝试按位置读取：第1列是代码，第3列是行业
-            mapping = dict(zip(df.iloc[:, 0].astype(str).str.strip(), df.iloc[:, 2].astype(str).str.strip()))
+        df.columns = [str(c).strip() for c in df.columns]
+
+        # 可能的列名
+        code_cols = [c for c in df.columns if c.lower() in {"code", "company_code", "ticker"}]
+        industry_cols = [c for c in df.columns if c.lower() in {"industry", "new_industry", "sector"}]
+        mcap_cols = [c for c in df.columns if "market" in c.lower()]
+
+        if not code_cols or not industry_cols:
+            # 后备：使用前两列
+            code_series = df.iloc[:, 0]
+            industry_series = df.iloc[:, 1]
         else:
-            mapping = dict(zip(df['company_code'].astype(str).str.strip(), df['new_industry'].astype(str).str.strip()))
-            
-        print(f"[INFO] Loaded mapping for {len(mapping)} companies.")
-        return mapping
+            code_series = df[code_cols[0]]
+            industry_series = df[industry_cols[0]]
+
+        code_to_industry = dict(
+            zip(code_series.astype(str).str.strip(), industry_series.astype(str).str.strip())
+        )
+
+        code_to_mcap = {}
+        if mcap_cols:
+            mcap_series = df[mcap_cols[0]]
+            code_to_mcap = dict(zip(code_series.astype(str).str.strip(), mcap_series))
+
+        print(f"[INFO] Loaded mapping for {len(code_to_industry)} companies (industry map).")
+        return code_to_industry, code_to_mcap
     except Exception as e:
         print(f"[ERROR] Error parsing industry mapping: {e}")
-        return {}
+        return {}, {}
 
-def get_file_pattern(prefix):
-    """根据前缀匹配当文件夹下的年份CSV文件"""
-    return f"{prefix} - 20*.csv"
-
-def process_year_file(filepath, industry_map):
+def process_year_df(df: pd.DataFrame, industry_map, marketcap_map):
     """
-    处理单一年份的文件：
-    1. 读取数据
-    2. 映射行业
-    3. 按行业聚合（计算均值）
+    处理单一年份的 DataFrame（来自 Excel sheet）：
+      1. 清理公司代码；
+      2. 映射行业；
+      3. 按行业聚合数值变量均值；
+      4. 返回聚合后的 DataFrame 及用于相似度的特征列。
     """
-    df = read_csv_robust(filepath)
-    if df is None:
+    if df is None or df.empty:
         return None, None
 
-    try:
-        # 清理 Code 列，用于匹配
-        if 'Code' in df.columns:
-            df['Code_Clean'] = df['Code'].astype(str).str.strip()
-        elif 'company_code' in df.columns:
-            df['Code_Clean'] = df['company_code'].astype(str).str.strip()
-        else:
-            # 尝试找包含 .SZ/.SS/.HK 的列
-            found = False
-            for col in df.columns:
-                if df[col].astype(str).str.contains(r'\.(SZ|HK|SS|SH)', regex=True).any():
-                    df['Code_Clean'] = df[col].astype(str).str.strip()
-                    found = True
-                    break
-            if not found:
-                return None, None
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
 
-        # 映射行业
-        df['Industry'] = df['Code_Clean'].map(industry_map)
-        
-        # 过滤掉没有行业归属的公司
-        df_clean = df.dropna(subset=['Industry'])
-        
-        if df_clean.empty:
-            return None, None
-
-        # 提取数值列用于计算
-        numeric_cols = df_clean.select_dtypes(include=[np.number]).columns.tolist()
-        # 排除无意义的列
-        numeric_cols = [c for c in numeric_cols if 'Year' not in c and c != 'Unnamed: 0']
-        
-        # Super-node Aggregation 核心逻辑：按行业分组
-        # 1. 计算均值 (每个行业的特征向量)
-        df_industry_mean = df_clean.groupby('Industry')[numeric_cols].mean()
-        
-        # 2. 计算公司数量 (作为节点大小权重)
-        df_industry_count = df_clean.groupby('Industry')['Code_Clean'].count()
-        
-        # 将数量合并进去
-        df_industry_mean['company_count'] = df_industry_count
-        
-        # 数据归一化处理 (MinMax)，防止量纲影响欧氏距离
-        feature_cols = [c for c in df_industry_mean.columns if c != 'company_count']
-        if not feature_cols:
-            return None, None
-            
-        scaler = MinMaxScaler()
-        df_industry_mean[feature_cols] = scaler.fit_transform(df_industry_mean[feature_cols].fillna(0))
-        
-        return df_industry_mean, feature_cols
-    except Exception as e:
-        print(f"Error processing file {filepath}: {e}")
+    # 处理公司代码
+    code_col = None
+    for candidate in ["Code", "code", "company_code", "Ticker", "ticker"]:
+        if candidate in df.columns:
+            code_col = candidate
+            break
+    if code_col is None:
         return None, None
+
+    df["Code_Clean"] = df[code_col].astype(str).str.strip()
+    df["Industry"] = df["Code_Clean"].map(industry_map)
+    df["MarketCap"] = df["Code_Clean"].map(marketcap_map) if marketcap_map else np.nan
+
+    df_clean = df.dropna(subset=["Industry"]).copy()
+    if df_clean.empty:
+        return None, None
+
+    # 数值列（排除年份等标识列）
+    numeric_cols = df_clean.select_dtypes(include=[np.number]).columns.tolist()
+    numeric_cols = [c for c in numeric_cols if c not in {"Year"}]
+
+    if not numeric_cols:
+        return None, None
+
+    # 行业聚合
+    df_industry_mean = df_clean.groupby("Industry")[numeric_cols].mean()
+    df_industry_count = df_clean.groupby("Industry")["Code_Clean"].count()
+    df_industry_mean["company_count"] = df_industry_count
+
+    # 市值（如果提供）：行业层面的平均值
+    if "MarketCap" in df_industry_mean.columns:
+        df_industry_mean.rename(columns={"MarketCap": "avg_market_cap"}, inplace=True)
+
+    feature_cols = [c for c in df_industry_mean.columns if c != "company_count"]
+    scaler = MinMaxScaler()
+    df_industry_mean[feature_cols] = scaler.fit_transform(df_industry_mean[feature_cols].fillna(0))
+
+    return df_industry_mean, feature_cols
 
 # ---------------- NETWORK CONSTRUCTION ---------------- #
 
@@ -454,66 +470,45 @@ def build_dynamic_html_timeline(graphs_dict, dataset_name, output_path):
 
 def main():
     print("--- Starting Industry Network Generation ---")
-    
+
     # 1. 加载行业映射
     print(f"Loading industry map from {INDUSTRY_FILE}...")
-    industry_map = load_industry_mapping(INDUSTRY_FILE)
+    industry_map, marketcap_map = load_industry_mapping(INDUSTRY_FILE)
     if not industry_map:
         print("Error: Could not load industry map (Empty). Exiting.")
         return
 
     all_metrics = []
 
-    # 2. 遍历三个数据集 (GLOBAL, RISK, RETURN)
-    for ds_name, file_prefix in DATA_FILES.items():
+    # 2. 遍历三个数据集 (GLOBAL, RISK, RETURN) - 使用 Excel 年份 sheet
+    for ds_name, excel_path in DATA_FILES.items():
         print(f"\nProcessing Dataset: {ds_name}")
-        
-        # 查找该类别下的所有年份文件
-        pattern = get_file_pattern(file_prefix)
-        files = glob.glob(pattern)
-        
-        # 排序年份
-        try:
-            files.sort(key=lambda x: int(x.split(' - ')[-1].replace('.csv', '')))
-        except:
-            files.sort() # fallback
-            
-        if not files:
-            print(f"  No files found for pattern: {pattern}")
+
+        if not os.path.exists(excel_path):
+            print(f"  [WARN] File not found: {excel_path}")
             continue
 
+        xls = pd.ExcelFile(excel_path)
+        year_sheets = [sh for sh in xls.sheet_names if str(sh).isdigit()]
         graphs_by_year = {}
 
-        for fpath in files:
-            # 提取年份
-            try:
-                year_str = fpath.split(' - ')[-1].replace('.csv', '')
-            except:
-                year_str = "Unknown"
-                
-            print(f"  > Processing Year: {year_str}")
-            
-            # 核心：聚合处理
-            df_agg, features = process_year_file(fpath, industry_map)
-            
+        for sh in sorted(year_sheets, key=lambda s: int(s)):
+            print(f"  > Processing Year: {sh}")
+            df_year = pd.read_excel(excel_path, sheet_name=sh)
+
+            df_agg, features = process_year_df(df_year, industry_map, marketcap_map)
+
             if df_agg is None or df_agg.empty:
-                print(f"    Skipping {year_str} (No valid data after merging)")
+                print(f"    Skipping {sh} (No valid data after merging)")
                 continue
-                
-            # 核心：建图
+
             G = build_network_from_aggregated(df_agg, features, threshold=SIM_THRESHOLD)
-            
-            # 保存
-            graphs_by_year[year_str] = G
-            
-            # 1. 静态图
-            save_static_plot(G, year_str, ds_name)
-            
-            # 2. 计算指标
-            m = calculate_graph_metrics(G, year_str, ds_name)
+            graphs_by_year[str(sh)] = G
+
+            save_static_plot(G, sh, ds_name)
+            m = calculate_graph_metrics(G, sh, ds_name)
             all_metrics.append(m)
 
-        # 3. 生成该数据集的动态时间轴 HTML
         if graphs_by_year:
             html_path = os.path.join(HTML_DIR, f"{ds_name}_dynamic_industry.html")
             build_dynamic_html_timeline(graphs_by_year, ds_name, html_path)
@@ -522,8 +517,26 @@ def main():
     if all_metrics:
         metrics_df = pd.DataFrame(all_metrics)
         # 调整列顺序
-        cols = ["Dataset", "Year", "Nodes (Industries)", "Edges", "Density", "Avg Degree"] + \
-               [c for c in metrics_df.columns if c not in ["Dataset", "Year", "Nodes (Industries)", "Edges", "Density", "Avg Degree"]]
+        cols = [
+            "Dataset",
+            "Year",
+            "Nodes (Industries)",
+            "Edges",
+            "Density",
+            "Avg Degree",
+        ] + [
+            c
+            for c in metrics_df.columns
+            if c
+            not in [
+                "Dataset",
+                "Year",
+                "Nodes (Industries)",
+                "Edges",
+                "Density",
+                "Avg Degree",
+            ]
+        ]
         metrics_df = metrics_df[cols]
         
         metrics_df.to_excel(METRICS_FILE, index=False)
