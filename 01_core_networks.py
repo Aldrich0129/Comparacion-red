@@ -174,6 +174,7 @@ def plot_core_graph(G: nx.Graph,
     plt.tight_layout()
     plt.savefig(out_path, dpi=300)
     plt.close()
+    print(f"  -> Saved core network PNG: {out_path}")
 
 
 # =========================
@@ -286,6 +287,7 @@ def build_animated_years_html_core(graphs, dataset_name: str, out_html: str):
     )
     Path(out_html).parent.mkdir(parents=True, exist_ok=True)
     fig.write_html(out_html, include_plotlyjs="cdn")
+    print(f"  -> Saved animated core network HTML (years): {out_html}")
 
 
 # =========================
@@ -387,6 +389,7 @@ def build_animated_variables_html_core(var_graphs, out_html: str):
     )
     Path(out_html).parent.mkdir(parents=True, exist_ok=True)
     fig.write_html(out_html, include_plotlyjs="cdn")
+    print(f"  -> Saved animated core network HTML (variables): {out_html}")
 
 
 # =========================

@@ -281,6 +281,7 @@ def plot_community_graph(G: nx.Graph,
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_path, dpi=300)
     plt.close()
+    print(f"  -> Saved community representatives PNG: {out_path}")
 
 
 # =========================
@@ -412,6 +413,7 @@ def build_animated_years_html_communities(comm_graphs, dataset_name: str, out_ht
     )
     Path(out_html).parent.mkdir(parents=True, exist_ok=True)
     fig.write_html(out_html, include_plotlyjs="cdn")
+    print(f"  -> Saved animated community HTML (years): {out_html}")
 
 
 # =========================
@@ -530,6 +532,7 @@ def build_animated_variables_html_communities(var_comm_graphs, out_html: str):
     )
     Path(out_html).parent.mkdir(parents=True, exist_ok=True)
     fig.write_html(out_html, include_plotlyjs="cdn")
+    print(f"  -> Saved animated community HTML (variables): {out_html}")
 
 
 # =========================

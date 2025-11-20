@@ -372,6 +372,7 @@ def plot_static_graph(G: nx.Graph, meta: dict, out_path: str):
     plt.tight_layout()
     plt.savefig(out_path, dpi=300)
     plt.close()
+    print(f"  -> Saved company network PNG: {out_path}")
 
 
 def sanitize_filename(text: str) -> str:
@@ -511,6 +512,7 @@ def build_animated_years_html(graphs, dataset_name: str, out_html: str):
         )
     )
     fig.write_html(out_html, include_plotlyjs="cdn")
+    print(f"  -> Saved animated company network HTML (years): {out_html}")
 
 
 def build_animated_variables_html(var_graphs, out_html: str):
@@ -613,6 +615,7 @@ def build_animated_variables_html(var_graphs, out_html: str):
         )
     )
     fig.write_html(out_html, include_plotlyjs="cdn")
+    print(f"  -> Saved animated company network HTML (variables): {out_html}")
 
 
 def main():
