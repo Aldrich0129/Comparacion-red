@@ -364,9 +364,8 @@ def build_dynamic_html_timeline(graphs_dict, dataset_name, output_path):
             size=node_size,
             colorbar=dict(
                 thickness=15,
-                title='Degree Centrality',
-                xanchor='left',
-                titleside='right'
+                title=dict(text='Degree Centrality', side='right'),
+                xanchor='left'
             ),
             line_width=2
         ),

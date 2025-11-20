@@ -113,6 +113,7 @@ def generate_adjacency_heatmap(
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_path, dpi=300)
     plt.close()
+    print(f"  -> Saved adjacency matrix PNG: {out_path}")
 
 
 # =====================
@@ -161,6 +162,7 @@ def generate_centrality_timeseries(
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_path, dpi=300)
     plt.close()
+    print(f"  -> Saved centrality timeseries PNG: {out_path}")
 
 
 # =====================
